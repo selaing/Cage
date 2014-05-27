@@ -1,0 +1,7 @@
+Installation Notes:
+
+Usage of this dissector requires the installtion of libudis86. This is used to disassemble instructions and display the disassembled instruction in the packet analysis.
+After installing libudis86 you must tell Wireshark to use it by modifying the top level Makefile.am. Add the line
+'-dlopen /usr/local/lib/libudis86.la' (or your path to libudis86.la if different)
+under the heading 'plugin_ldadd = $(_CUSTOM_plugin_ldadd_)
+
