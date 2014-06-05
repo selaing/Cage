@@ -42,8 +42,8 @@ diff -prauN pure/linux-3.9.4/arch/x86/kernel/traps.c cage/linux-3.9.4/arch/x86/k
  
 diff -prauN pure/linux-3.9.4/arch/x86/mm/cage.c cage/linux-3.9.4/arch/x86/mm/cage.c
 --- pure/linux-3.9.4/arch/x86/mm/cage.c	1969-12-31 19:00:00.000000000 -0500
-+++ cage/linux-3.9.4/arch/x86/mm/cage.c	2014-05-27 15:54:54.475490421 -0400
-@@ -0,0 +1,252 @@
++++ cage/linux-3.9.4/arch/x86/mm/cage.c	2014-06-04 15:22:03.221027559 -0400
+@@ -0,0 +1,257 @@
 +#ifdef CONFIG_CAGE
 +
 +#include <asm/tlbflush.h>
@@ -124,10 +124,13 @@ diff -prauN pure/linux-3.9.4/arch/x86/mm/cage.c cage/linux-3.9.4/arch/x86/mm/cag
 +		case 0x00:
 +			mp->rwx = 0x04; // r__
 +			break;
-+	} 
++	}
++ 
 +	ret = access_process_vm(ts, (unsigned long)fault_instruction, &mp->instruction, 15, 0);
 +	if(ret != 15)
 +		mp->instruction[0] = 0xff;
++
++//	mp->instruction[0] = 0xff;
 +	mp->pid = ts->pid;
 +	mp->uid = ts->real_cred->uid;
 +	
@@ -135,6 +138,7 @@ diff -prauN pure/linux-3.9.4/arch/x86/mm/cage.c cage/linux-3.9.4/arch/x86/mm/cag
 +	if(ret != 8)
 +		mp->data = 0x00BADACC;
 +
++//	mp->data = 0x00000000;
 +	return mp;
 +}
 +/*
@@ -195,6 +199,7 @@ diff -prauN pure/linux-3.9.4/arch/x86/mm/cage.c cage/linux-3.9.4/arch/x86/mm/cag
 +		mp = create_packet((long *)fault_instruction, (long *)fault_address, pte_instr, pte_address, error_code, tsk);
 +		cage_enqueue(mp);
 +		dev->netdev_ops->ndo_start_xmit(NULL, dev);	
++		kfree(mp);
 +	}
 +
 +	if(cage_access_allowed(pte_address, pte_instr)){
@@ -361,11 +366,10 @@ diff -prauN pure/linux-3.9.4/arch/x86/syscalls/syscall_64.tbl cage/linux-3.9.4/a
  # for native 64-bit operation.
 diff -prauN pure/linux-3.9.4/chmem/chmem.c cage/linux-3.9.4/chmem/chmem.c
 --- pure/linux-3.9.4/chmem/chmem.c	1969-12-31 19:00:00.000000000 -0500
-+++ cage/linux-3.9.4/chmem/chmem.c	2014-05-13 14:03:09.247513525 -0400
-@@ -0,0 +1,115 @@
++++ cage/linux-3.9.4/chmem/chmem.c	2014-06-04 15:16:17.680574098 -0400
+@@ -0,0 +1,111 @@
 +#include <linux/kernel.h>
 +#include <linux/linkage.h>
-+#include <linux/chmem.h>
 +#include <linux/errno.h>
 +#include <linux/mm.h>
 +#include <asm/uaccess.h>
@@ -377,27 +381,43 @@ diff -prauN pure/linux-3.9.4/chmem/chmem.c cage/linux-3.9.4/chmem/chmem.c
 +#define CAGE 0x0000000000000200
 +#define US 0x000000000000004
 +
-+long label_caged_vm_area(pid_t pid, unsigned long address, unsigned long label){
-+	struct task_struct *ts;
-+	ts = pid_task(find_vpid(pid), PIDTYPE_PID);
-+	if(!ts)
-+		return -ESRCH;
-+	return 0;
-+}
 +
-+long info_caged_vm_area(pid_t pid, struct cage_info __user *buffer){
-+	struct task_struct *ts;
-+	ts = pid_task(find_vpid(pid), PIDTYPE_PID);
-+	if(!ts)
-+		return -ESRCH;
-+	return 0;
-+}
 +
 +long uncage_vm_area(pid_t pid, unsigned long address){
 +	struct task_struct *ts;
++	struct mm_struct *mm;
++	struct vm_area_struct *vm;
++	unsigned long addr;
++	pte_t *pte;
++	pteval_t new;
++
 +	ts = pid_task(find_vpid(pid), PIDTYPE_PID);
 +	if(!ts)
 +		return -ESRCH;
++	mm = ts->mm;
++	down_write(&mm->mmap_sem);
++	vm = find_vma(mm, address);
++	if(!vm){
++		up_write(&mm->mmap_sem);
++		return -EFAULT;
++	}
++	
++	vm->vm_page_prot.pgprot |= US;
++	vm->vm_page_prot.pgprot &= ~CAGE;
++	addr = vm->vm_start;
++	while(addr < vm->vm_end){
++		pte = cage_lookup_address(addr,mm);
++		new = pte_val(*pte);
++		if(!pte_none(*pte)){
++			new |= US;
++			new &= ~CAGE;
++			set_pte_atomic(pte, __pte(new));
++		}
++		addr += PAGE_SIZE;
++	}
++
++	up_write(&mm->mmap_sem);
++	
 +	return 0;
 +}
 +
@@ -415,65 +435,46 @@ diff -prauN pure/linux-3.9.4/chmem/chmem.c cage/linux-3.9.4/chmem/chmem.c
 +	if(!ts)
 +		return -ESRCH;
 +	mm = ts->mm;
-+	down_read(&mm->mmap_sem);
++	down_write(&mm->mmap_sem);
 +	vm = find_vma(mm, address);
 +	if(!vm){
-+		up_read(&mm->mmap_sem);
++		up_write(&mm->mmap_sem);
 +		return -EFAULT;
 +	}
 +	old_nx = vm->vm_page_prot.pgprot & NX;
-+	printk("old_page_prot %16lx\n", vm->vm_page_prot.pgprot);
 +	new_page_prot = label << 52;
 +	if(old_nx == 0x8000000000000000)
 +		new_page_prot |= old_nx;
 +	else
 +		new_page_prot &= old_nx;	
-+	printk("new_page_prot %16lx\n", new_page_prot);
 +	vm->vm_page_prot.pgprot |= new_page_prot; 
 +	vm->vm_page_prot.pgprot &= ~US;
 +	vm->vm_page_prot.pgprot |= CAGE;
-+	printk("vm_page_prot %16lx\n", vm->vm_page_prot.pgprot);
 +	addr = vm->vm_start;
 +	while(addr < vm->vm_end){
 +		pte = cage_lookup_address(addr, mm);		
 +		new = pte_val(*pte);
 +		if(!pte_none(*pte)){
-+			printk("old ptes %16lx\n", new);
 +			new |= new_page_prot;
 +			new &= ~US;
 +			new |= CAGE;
 +			set_pte_atomic(pte, __pte(new));
-+			printk("new ptes %16lx\n", new);
 +		}
 +		addr += PAGE_SIZE;		
 +	}
 +	ts->caged_process = 1;
-+	up_read(&mm->mmap_sem);
++	up_write(&mm->mmap_sem);
 +	
 +	return 0;
 +}
 +
-+asmlinkage long sys_chmem(int selection, pid_t pid, unsigned long address, unsigned long label, struct cage_info __user *buffer){
-+	printk(KERN_INFO "Hello from sys_chmem\n");
++asmlinkage long sys_chmem(int selection, pid_t pid, unsigned long address, unsigned long label){
 +
 +	if(selection == 0){
 +		return cage_vm_area(pid, address, label);
 +	}
 +	else if(selection == 1){
 +		return uncage_vm_area(pid, address);
-+	}
-+	else if(selection == 2){
-+		if(access_ok(VERIFY_WRITE, buffer, sizeof(struct cage_info)*50)){
-+			if(sizeof(buffer) == sizeof(struct cage_info)*50)
-+				return info_caged_vm_area(pid, buffer);
-+			else
-+				return -EFAULT;
-+		}
-+		else
-+			return -EFAULT;
-+	}
-+	else if(selection == 3){
-+		return label_caged_vm_area(pid, address, label);
 +	}
 +	else
 +		return -EINVAL;
@@ -645,17 +646,6 @@ diff -prauN pure/linux-3.9.4/include/linux/cage.h cage/linux-3.9.4/include/linux
 +	return 0;
 +}
 +#endif
-diff -prauN pure/linux-3.9.4/include/linux/chmem.h cage/linux-3.9.4/include/linux/chmem.h
---- pure/linux-3.9.4/include/linux/chmem.h	1969-12-31 19:00:00.000000000 -0500
-+++ cage/linux-3.9.4/include/linux/chmem.h	2014-05-13 14:03:09.249513608 -0400
-@@ -0,0 +1,7 @@
-+#ifdef CONFIG_CAGE
-+
-+struct cage_info{
-+	unsigned long pte_data;
-+	unsigned long vm_start;
-+};
-+#endif
 diff -prauN pure/linux-3.9.4/include/linux/mm.h cage/linux-3.9.4/include/linux/mm.h
 --- pure/linux-3.9.4/include/linux/mm.h	2013-05-24 14:45:59.000000000 -0400
 +++ cage/linux-3.9.4/include/linux/mm.h	2014-05-13 14:03:09.249513608 -0400
@@ -688,23 +678,13 @@ diff -prauN pure/linux-3.9.4/include/linux/sched.h cage/linux-3.9.4/include/linu
  	int on_cpu;
 diff -prauN pure/linux-3.9.4/include/linux/syscalls.h cage/linux-3.9.4/include/linux/syscalls.h
 --- pure/linux-3.9.4/include/linux/syscalls.h	2013-05-24 14:45:59.000000000 -0400
-+++ cage/linux-3.9.4/include/linux/syscalls.h	2014-05-13 14:03:09.250513648 -0400
-@@ -77,6 +77,9 @@ struct sigaltstack;
- #include <linux/quota.h>
- #include <linux/key.h>
- #include <trace/syscall.h>
-+#ifdef CONFIG_CAGE
-+#include <linux/chmem.h>
-+#endif
- 
- #define __SC_DECL1(t1, a1)	t1 a1
- #define __SC_DECL2(t2, a2, ...) t2 a2, __SC_DECL1(__VA_ARGS__)
-@@ -897,4 +900,7 @@ asmlinkage long sys_process_vm_writev(pi
++++ cage/linux-3.9.4/include/linux/syscalls.h	2014-06-04 14:52:19.699130260 -0400
+@@ -897,4 +897,7 @@ asmlinkage long sys_process_vm_writev(pi
  asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
  			 unsigned long idx1, unsigned long idx2);
  asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
 +#ifdef CONFIG_CAGE
-+asmlinkage long sys_chmem(int selection, pid_t pid, unsigned long address, unsigned long label, struct cage_info __user *buffer);
++asmlinkage long sys_chmem(int selection, pid_t pid, unsigned long address, unsigned long label);
 +#endif
  #endif
 diff -prauN pure/linux-3.9.4/include/uapi/asm-generic/mman-common.h cage/linux-3.9.4/include/uapi/asm-generic/mman-common.h

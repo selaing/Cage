@@ -2,3 +2,13 @@ Installation Notes:
 
 This patch must be applied to the 3.9.4 version of the linux kernel.
 
+To execute a caged program compile and run cage_wrapper.c with the program to be executed.
+	ex: ./cage_wrapper ls -l
+
+To use the chmem system call compile and run chmem_user.c with appropriate options.
+	1. Cage vm_area: ./chmem_user <pid> <address of region to cage> <label>
+	2. Uncage vm_area: ./chmem_user <pid> <address of region to cage>
+	3. Change Label: ./chmem_user <pid> <address of region> <label>
+
+
+
