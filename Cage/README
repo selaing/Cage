@@ -6,9 +6,20 @@ To execute a caged program compile and run cage_wrapper.c with the program to be
 	ex: ./cage_wrapper ls -l
 
 To use the chmem system call compile and run chmem_user.c with appropriate options.
-	1. Cage vm_area: ./chmem_user <pid> <address of region to cage> <label>
-	2. Uncage vm_area: ./chmem_user <pid> <address of region to cage>
-	3. Change Label: ./chmem_user <pid> <address of region> <label>
+	1. Cage vm_area: ./chmem_user -c <pid> <address of region to cage> <label>
+	2. Uncage vm_area: ./chmem_user -u <pid> <address of region to cage>
+	3. Change Label: ./chmem_user -l <pid> <address of region> <label>
 
+To use the BPF filters first select which filter to use and uncomment it. Compile the LKM temporal.c.
+	1. Temporal filter: insmod temporal.ko begin_address=<address> end_address=<address> num=0 type=3
+		NOTE: type 1 shows read only events, type 2 shows write only events, type 3 shows both read and write events. num may be any value, 0 shows all events, 1 shows every other event, etc.
+
+	2. Data-Overwriting Filter: insmod temporal.ko begin_address=<address> num=<value to overwrite with> type=4
+
+	3. Instruction-Overwriting Filter: insmod temporal.ko begin_address=<address of instruction> num=<length of instruction> insn=<instruction opcode> type=5
+
+	4. Buffer-Viewing Filter: insmod temporal.ko begin_address=<address> num=<size of buffer> type=6
+
+	5. Buffer Finding Filter: insmod temporal.ko type=7
 
 

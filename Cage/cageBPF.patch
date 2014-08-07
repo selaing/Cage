@@ -1,0 +1,1462 @@
+diff -prauN pure/linux-3.9.4/arch/x86/Kconfig BPF/linux-3.9.4/arch/x86/Kconfig
+--- pure/linux-3.9.4/arch/x86/Kconfig	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/arch/x86/Kconfig	2014-07-11 17:11:02.095817532 -0400
+@@ -17,6 +17,12 @@ config X86_64
+ 	depends on 64BIT
+ 	select X86_DEV_DMA_OPS
+ 
++config CAGE
++	bool "CAGE (EXPERIMENTAL)"
++	default y
++	---help---
++	CIPL-CAGE functionality
++
+ ### Arch settings
+ config X86
+ 	def_bool y
+diff -prauN pure/linux-3.9.4/arch/x86/kernel/traps.c BPF/linux-3.9.4/arch/x86/kernel/traps.c
+--- pure/linux-3.9.4/arch/x86/kernel/traps.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/arch/x86/kernel/traps.c	2014-07-11 17:11:02.096817532 -0400
+@@ -44,6 +44,10 @@
+ #include <linux/edac.h>
+ #endif
+ 
++#ifdef CONFIG_CAGE
++#include <linux/cage.h>
++#endif
++
+ #include <asm/kmemcheck.h>
+ #include <asm/stacktrace.h>
+ #include <asm/processor.h>
+@@ -416,6 +420,11 @@ dotraplinkage void __kprobes do_debug(st
+ 	if ((dr6 & DR_STEP) && kmemcheck_trap(regs))
+ 		goto exit;
+ 
++#ifdef CONFIG_CAGE
++	if((dr6 & DR_STEP) && cage_page(regs, tsk))
++		goto exit;
++#endif
++
+ 	/* DR6 may or may not be cleared by the CPU */
+ 	set_debugreg(0, 6);
+ 
+diff -prauN pure/linux-3.9.4/arch/x86/mm/cage.c BPF/linux-3.9.4/arch/x86/mm/cage.c
+--- pure/linux-3.9.4/arch/x86/mm/cage.c	1969-12-31 19:00:00.000000000 -0500
++++ BPF/linux-3.9.4/arch/x86/mm/cage.c	2014-08-07 15:08:30.535547179 -0400
+@@ -0,0 +1,550 @@
++#ifdef CONFIG_CAGE
++
++#include <asm/tlbflush.h>
++#include <asm/traps.h>
++#include <linux/cage.h>
++#include <linux/slab.h>
++#include <linux/netdevice.h>
++#include <asm/processor.h>
++#include <asm/uaccess.h>
++#include <linux/mm.h>
++#include <asm/special_insns.h>
++#include <linux/filter.h>
++#include <linux/highmem.h>
++#include <asm-generic/cacheflush.h>
++#include <linux/pagemap.h>
++
++#define PF_INSTR	0x10
++
++struct memevent_packet *queue_head = NULL;
++struct memevent_packet *queue_current = NULL;
++struct memevent_packet *queue_start = NULL;
++
++struct cage_filter *filter = NULL;
++unsigned long ea = 0;
++unsigned long eip = 0;
++int current_events = 0;
++int flag = 0;
++unsigned long stored_ea = 0;
++unsigned long rax = 0;
++
++struct memevent_packet * dequeue(void){
++	struct memevent_packet *mp; 
++	if(queue_head != queue_current){
++		mp = queue_head;
++		if(queue_head < (queue_start +10)){
++			queue_head++;
++			return mp;
++		}
++		else{
++			queue_head = queue_start;
++			return mp;
++		}
++	}
++	return NULL;
++}
++EXPORT_SYMBOL(dequeue);
++
++void cage_enqueue(struct memevent_packet *mp){
++	*queue_current = *mp;
++	if(queue_current < (queue_start + 10))
++		queue_current++;
++	else
++		queue_current = queue_start;
++	
++	return;	
++}
++EXPORT_SYMBOL(cage_enqueue);
++
++struct memevent_packet *cage_get_queue_start(void){
++	return queue_start;
++}
++EXPORT_SYMBOL(cage_get_queue_start);
++
++void set_queue_start(struct memevent_packet *queue){
++	queue_start = queue;
++	queue_head = queue_start;
++	queue_current = queue_start;
++	return;
++}
++EXPORT_SYMBOL(set_queue_start);
++
++void set_cage_filter(struct cage_filter *filt){
++	filter = filt;
++	return;
++}
++EXPORT_SYMBOL(set_cage_filter);
++
++struct memevent_packet * create_packet(unsigned long *fault_instruction, unsigned long *fault_address, pte_t *pte_instruction, pte_t *pte_address, unsigned long error_code, struct task_struct *ts){
++	int ret;
++	struct memevent_packet *mp;
++
++	mp = kmalloc(sizeof(struct memevent_packet), GFP_KERNEL);
++	mp->src = (long)fault_instruction;
++	mp->dest = (long)fault_address;
++	mp->src_dest_pte = (((pte_instruction->pte & CAGE_LABEL) >>31) | 
++			    ((pte_address->pte & CAGE_LABEL) >> 42) | 
++			     (pte_address->pte & PTE_METADATA));
++	switch(error_code & RWX_FLAGS){
++		case 0x12:
++			mp->rwx = 0x03;	// _wx
++			break;
++		case 0x10:
++			mp->rwx = 0x05; // r_x
++			break;
++		case 0x02:
++			mp->rwx = 0x02; // _w_
++			break;
++		case 0x00:
++			mp->rwx = 0x04; // r__
++			break;
++	} 
++	ret = access_process_vm(ts, (unsigned long)fault_instruction, &mp->instruction, 15, 0);
++	if(ret != 15)
++		mp->instruction[0] = 0xff;
++	mp->pid = ts->pid;
++	mp->uid = ts->real_cred->uid;
++	
++	ret = access_process_vm(ts, (unsigned long)fault_address, &mp->data, 8, 0);
++	if(ret != 8)
++		mp->data = 0x00BADACC;
++
++	return mp;
++}
++int cage_get_flag(void){
++	return flag;
++}
++void cage_set_flag(int value){
++	flag = value;
++}
++EXPORT_SYMBOL(cage_set_flag);
++
++unsigned long cage_get_stored_ea(void){
++	return stored_ea;
++}
++void cage_set_stored_ea(unsigned long value){
++	stored_ea = value;
++}
++EXPORT_SYMBOL(cage_set_stored_ea);
++
++unsigned long cage_get_eip(void){
++	return eip;
++}
++void cage_clear_eip(void){
++	eip = 0;
++}
++EXPORT_SYMBOL(cage_clear_eip);
++
++unsigned long cage_get_rax(void){
++	return rax;
++}
++void cage_clear_rax(void){
++	rax = 0;
++}
++EXPORT_SYMBOL(cage_clear_rax);
++
++unsigned long cage_load_filter(int offset){
++	if(offset == 1)
++		return cage_get_ea();
++	if(offset == 2)
++		return (unsigned long)cage_get_current_events();
++	if(offset == 3)
++		return cage_get_eip();
++	if(offset == 4)
++		return cage_get_flag();
++	if(offset == 5)
++		return cage_get_stored_ea();
++	if(offset == 6)
++		return cage_get_rax();
++	return 0;
++}
++EXPORT_SYMBOL(cage_load_filter);
++
++unsigned long cage_get_ea(void){
++	return ea;
++}
++EXPORT_SYMBOL(cage_get_ea);
++
++unsigned long cage_get_begin_address(void){
++	return filter->start_address;
++}
++EXPORT_SYMBOL(cage_get_begin_address);
++
++unsigned long cage_get_end_address(void){
++	return filter->end_address;
++}
++EXPORT_SYMBOL(cage_get_end_address);
++
++int cage_get_num_events(void){
++	return filter->num_events;
++}
++EXPORT_SYMBOL(cage_get_num_events);
++
++int cage_get_current_events(void){
++	return current_events;
++}
++EXPORT_SYMBOL(cage_get_current_events);
++
++void cage_clear_current_events(void){
++	current_events = 0;
++}
++EXPORT_SYMBOL(cage_clear_current_events);
++
++int cage_copy_to_user(pte_t *pte_address, unsigned long *fault_address, struct task_struct *ts, int length, void *buf){
++	struct page *page;
++	struct vm_area_struct *vma;
++	void *maddr;
++	int offset;
++	int bytes;
++
++	down_read(&ts->mm->mmap_sem);
++	vma = find_vma(ts->mm, (unsigned long)fault_address);
++	if(!vma || vma->vm_start > (unsigned long)fault_address)
++		return -1;
++	offset = (unsigned long)fault_address & (PAGE_SIZE-1);
++	bytes = length;
++	if(bytes > PAGE_SIZE-offset)
++		bytes = PAGE_SIZE-offset;
++	page = vm_normal_page(vma, (unsigned long)fault_address, *pte_address);
++	if(!page)
++		return -1;
++	maddr = kmap(page);
++	copy_to_user_page(vma, page, (unsigned long)fault_address, maddr+offset, buf, bytes);
++	kunmap(page);
++	up_read(&ts->mm->mmap_sem);
++	
++	return (length - bytes);
++	
++	
++}
++
++static bool cage_access_allowed(pte_t *pte_address, pte_t *pte_instr, unsigned long error_code, struct task_struct *ts, unsigned long *fault_address, unsigned long *ins_address){
++	unsigned long ret = 0;
++	int ret2;
++	pteval_t new = pte_val(*pte_address);
++	if(filter){
++		if(filter->type == 1 && (error_code & CAGE_WRITE))	//type 1 read only temporal filter
++			return 0;	
++		if(filter->type == 2 && (error_code & CAGE_WRITE)){	//type 2 write only temporal filter
++			ret = sk_run_filter(NULL, filter->insns);
++			goto temporal_ret;
++		}
++		if(filter->type == 3){					//read and write temporal filter
++			ret = sk_run_filter(NULL, filter->insns);
++			goto temporal_ret;
++		}
++		if(filter->type == 4){					//overwrite data filter
++			ret = sk_run_filter(NULL, filter->insns);
++			if(ret == 0){
++				return 1;
++			}
++			else{
++				ret2 = cage_copy_to_user(pte_address, fault_address, ts, 8, &ret);
++				if(ret2 != 0)
++					printk("CAGE_COPY_TO_USER_FAILED\n");
++				return 1;
++			}
++		}			
++		if(filter->type == 5){					//overwrite instruction filter
++			ret = sk_run_filter(NULL, filter->insns);
++			if(ret == 0)
++				return 1;
++			else{
++				ret2 = cage_copy_to_user(pte_address, fault_address, ts, ret, (unsigned long *)filter->end_address);
++				if(ret2 != 0)
++					printk("CAGE_COPY_TO_USER_FAILED\n");
++				return 1;
++			}
++		}
++		if(filter->type == 6){					//find events for given buffer filter
++			ret = sk_run_filter(NULL, filter->insns);
++			if(ret == 0)
++				return 0;
++			else if(ret == 1)
++				return 1;
++			else{
++				if(ret == cage_get_eip()){
++					return 0;
++				}
++				else{
++					flag = 1;
++					stored_ea = ret;
++					return 1;
++				}
++			}
++		}
++		
++		if(filter->type == 7){					//find all buffers accessed seqentially in program
++			if((filter->num_events == 0) && !(error_code & CAGE_WRITE) && !(error_code & PF_INSTR)){	//read accesses only
++				ret = sk_run_filter(NULL, filter->insns);
++				if(ret == 1){
++					stored_ea = cage_get_ea();
++					return 1;
++				}
++				else{
++					stored_ea = cage_get_ea();
++					return 0;
++				}
++			}
++			if((filter->num_events == 1) && (error_code & CAGE_WRITE)){ 		//write accesses only
++				ret = sk_run_filter(NULL, filter->insns);
++				if(ret == 1){
++					stored_ea = cage_get_ea();
++					return 1;
++				}
++				else{
++					stored_ea = cage_get_ea();
++					return 0;
++				}
++			}
++			return 0;
++		}
++		
++temporal_ret:	
++		if(ret == 1){
++			current_events = 0;
++			return 1;
++		}
++		else if(ret == -1){
++			current_events++;
++			return 0;
++		}
++		else{
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/*
++ * Function returns pte of given address
++ * address - the address to find the pte for
++ * mm - mm_struct of process
++ */
++pte_t* cage_lookup_address(unsigned long address, struct mm_struct *mm){
++	pgd_t *pgd = pgd_offset(mm, address);
++	pud_t *pud;
++	pmd_t *pmd;
++
++	if(pgd_none(*pgd))
++		return NULL;
++
++	pud = pud_offset(pgd, address);
++	if(pud_none(*pud))
++		return NULL;
++
++	pmd = pmd_offset(pud, address);
++	if(pmd_none(*pmd))
++		return NULL;
++
++	return pte_offset_kernel(pmd, address);
++}
++
++/* 
++ * Function uncages the pte of the faulting address if the access is allowed and throws a segfault otherwise
++ * regs - values of the registers
++ * pte_address - pte of faulting address
++ * fault_address - address being accessed that caused the page fault
++ * fault_instruction - address of the instruction that caused the page fault
++ * error_code - reason for the page fault
++ * mm - mm_struct for process
++ */
++static bool cage_check_access(struct pt_regs *regs, pte_t *pte_address, unsigned long fault_address, unsigned long fault_instruction, unsigned long error_code, struct mm_struct *mm){
++	pte_t *pte_instr;
++	pteval_t new = pte_val(*pte_address);
++	struct task_struct *tsk = current;
++	siginfo_t info;
++	struct net_device *dev;
++	struct memevent_packet *mp;
++	int ret;
++	pte_instr = cage_lookup_address (fault_instruction, mm);
++
++	ret = cage_access_allowed(pte_address, pte_instr, error_code, tsk, (unsigned long *)fault_address, (unsigned long *)fault_instruction);
++	if(ret){
++		if(queue_start){
++			struct net *net = current->nsproxy->net_ns;
++			dev = __dev_get_by_name(net, "me");
++			mp = create_packet((long *)fault_instruction, (long *)fault_address, pte_instr, pte_address, error_code, tsk);
++			cage_enqueue(mp);
++			dev->netdev_ops->ndo_start_xmit(NULL, dev);	
++			kfree(mp);
++		}
++	}
++		new |= US_BIT;
++		set_pte_atomic(pte_address, __pte(new));
++		tsk->uncaged_flag = 1;
++		if(error_code & CAGE_FETCH)
++			if(tsk->f_address == fault_instruction)
++				tsk->f_address2 = fault_address;
++			else
++				tsk->f_address = fault_address;
++			
++		else
++			if(tsk->ex_flag == 0){
++				tsk->ex_address = fault_address;
++				tsk->ex_flag = 1;
++			}
++			else if(tsk->ex_flag == 1){
++				tsk->ex_address2 = fault_address;
++				tsk->ex_flag = 2;
++			}
++			else if(tsk->ex_flag == 2){
++				tsk->ex_address3 = fault_address;
++				tsk->ex_flag = 3;
++			}
++			else if(tsk->ex_flag == 3){
++				tsk->ex_address4 = fault_address;
++				tsk->ex_flag = 4;
++			}
++
++		regs->flags |= X86_EFLAGS_TF;
++		regs->flags &= ~X86_EFLAGS_IF;	
++
++		return 1;
++	
++	/*else{
++		tsk->uncaged_flag = 0;
++		tsk->thread.cr2 = fault_address;
++		tsk->thread.error_code = error_code;		
++		tsk->thread.trap_nr = X86_TRAP_PF;
++		
++		info.si_signo	= SIGSEGV;
++		info.si_errno	= 0;
++		info.si_code	= SEGV_ACCERR;
++		info.si_addr	= (void __user *)fault_address;
++
++		force_sig_info(SIGSEGV, &info, tsk);
++
++		return 0;
++	}*/
++	return 0;	 
++}
++
++/*
++ * Function returns true if the page is not caged and false if it is caged
++ * pte - the pte of the page to check
++ */
++bool caged_pte_check(pte_t pte){
++	if(pte_flags(pte) & CAGE_BIT){
++		if(!(pte_flags(pte) & US_BIT))
++			return 0;
++	}
++	return 1;
++}
++
++int cage_fault_in_kernel_space(unsigned long address){
++	return address >= TASK_SIZE_MAX;
++}
++/*
++ * Function is called from page fault handler
++ * regs - values in registers
++ * fault_address - address attempting to be accessed
++ * fault_instruction - address of instruction causing fault
++ * error_code - reason page_fault occured as given in page fault handler
++ * mm - mm_struct for process
++ * returns 1 if page was caged and was successfuly uncaged and 0 otherwise
++ */
++bool is_caged(struct pt_regs *regs, unsigned long fault_address, unsigned long fault_instruction, unsigned long error_code, struct mm_struct *mm){
++	pte_t *pte;
++	unsigned long pfn;
++
++	pte = cage_lookup_address(fault_address, mm);
++	if(!pte){
++		return 0;
++	}
++	if(!caged_pte_check(*pte)){
++		pfn = pte_pfn(*pte);
++		if(is_zero_pfn(pfn) && (error_code & CAGE_WRITE))
++			return 0;
++		if(cage_fault_in_kernel_space(fault_address))
++			return 0;
++		rax = regs->ax;
++		ea = fault_address;
++		eip = fault_instruction;
++		return cage_check_access(regs, pte, fault_address, fault_instruction, error_code, mm);
++	}
++		return 0;
++}
++
++/*
++ * This function is called from the debug fault handler. It cages a page once it is no longer being used, 
++ * i.e. once the next instruction occurs. It returns 1 if successful and 0 otherwise.
++ * regs - the values stored in the registers
++ * ts - the task_struct of the faulting process
++ */
++bool cage_page(struct pt_regs *regs, struct task_struct *ts){
++	pte_t *pte;
++	pteval_t new;
++	
++
++	if(ts->uncaged_flag){
++		if(ts->f_address){
++			pte = cage_lookup_address(ts->f_address, ts->mm);
++			new = pte_val(*pte);
++			new &= ~US_BIT;
++			set_pte_atomic(pte, __pte(new));
++
++			__flush_tlb_one(ts->f_address);
++			ts->f_address = 0;
++		}
++		if(ts->f_address2){
++			pte = cage_lookup_address(ts->f_address2, ts->mm);
++			new = pte_val(*pte);
++			new &= ~US_BIT;
++			set_pte_atomic(pte, __pte(new));
++
++			__flush_tlb_one(ts->f_address2);
++			ts->f_address2 = 0;
++
++		}
++		if(ts->ex_address){
++			ts->ex_flag = 0;
++			pte = cage_lookup_address(ts->ex_address, ts->mm);
++			new = pte_val(*pte);
++			new &= ~US_BIT;
++			set_pte_atomic(pte, __pte(new));
++
++			__flush_tlb_one(ts->ex_address);
++			ts->ex_address = 0;
++		}
++		if(ts->ex_address2){
++
++			pte = cage_lookup_address(ts->ex_address2, ts->mm);
++			new = pte_val(*pte);
++			new &= ~US_BIT;
++			set_pte_atomic(pte, __pte(new));
++
++			__flush_tlb_one(ts->ex_address2);
++			ts->ex_address2 = 0;
++		}
++
++		if(ts->ex_address3){
++
++			pte = cage_lookup_address(ts->ex_address3, ts->mm);
++			new = pte_val(*pte);
++			new &= ~US_BIT;
++			set_pte_atomic(pte, __pte(new));
++
++			__flush_tlb_one(ts->ex_address3);
++			ts->ex_address3 = 0;
++		}
++		if(ts->ex_address4){
++
++			pte = cage_lookup_address(ts->ex_address4, ts->mm);
++			new = pte_val(*pte);
++			new &= ~US_BIT;
++			set_pte_atomic(pte, __pte(new));
++
++			__flush_tlb_one(ts->ex_address4);
++			ts->ex_address4 = 0;
++		}
++		regs->flags &= ~X86_EFLAGS_TF;
++		regs->flags |= X86_EFLAGS_IF;
++		ts->uncaged_flag = 0;
++		return 1;
++	}
++	printk("IF I REACHED HERE YOURE SCREWED!\n");
++	return 0;
++}
++
++#endif
+diff -prauN pure/linux-3.9.4/arch/x86/mm/fault.c BPF/linux-3.9.4/arch/x86/mm/fault.c
+--- pure/linux-3.9.4/arch/x86/mm/fault.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/arch/x86/mm/fault.c	2014-07-11 17:11:02.097817532 -0400
+@@ -20,6 +20,10 @@
+ #include <asm/fixmap.h>			/* VSYSCALL_START		*/
+ #include <asm/context_tracking.h>	/* exception_enter(), ...	*/
+ 
++#ifdef CONFIG_CAGE
++#include <linux/cage.h>
++#endif
++
+ /*
+  * Page fault error code bits:
+  *
+@@ -1031,7 +1035,16 @@ __do_page_fault(struct pt_regs *regs, un
+ 
+ 	if (unlikely(kmmio_fault(regs, address)))
+ 		return;
+-
++	
++#ifdef CONFIG_CAGE
++	if(tsk->caged_process){
++		if(unlikely((error_code & PF_PROT) && (error_code & PF_USER))){
++			if(is_caged(regs, address, regs->ip, error_code, mm))
++				return;
++		}
++	}
++		
++#endif
+ 	/*
+ 	 * We fault-in kernel-space virtual memory on-demand. The
+ 	 * 'reference' page table is init_mm.pgd.
+@@ -1175,6 +1188,7 @@ retry:
+ 	 * we can handle it..
+ 	 */
+ good_area:
++	
+ 	if (unlikely(access_error(error_code, vma))) {
+ 		bad_area_access_error(regs, error_code, address);
+ 		return;
+diff -prauN pure/linux-3.9.4/arch/x86/mm/Makefile BPF/linux-3.9.4/arch/x86/mm/Makefile
+--- pure/linux-3.9.4/arch/x86/mm/Makefile	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/arch/x86/mm/Makefile	2014-07-11 17:11:02.097817532 -0400
+@@ -28,3 +28,5 @@ obj-$(CONFIG_ACPI_NUMA)		+= srat.o
+ obj-$(CONFIG_NUMA_EMU)		+= numa_emulation.o
+ 
+ obj-$(CONFIG_MEMTEST)		+= memtest.o
++
++obj-$(CONFIG_CAGE)		+= cage.o
+diff -prauN pure/linux-3.9.4/arch/x86/syscalls/syscall_64.tbl BPF/linux-3.9.4/arch/x86/syscalls/syscall_64.tbl
+--- pure/linux-3.9.4/arch/x86/syscalls/syscall_64.tbl	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/arch/x86/syscalls/syscall_64.tbl	2014-07-11 17:11:02.097817532 -0400
+@@ -320,7 +320,9 @@
+ 311	64	process_vm_writev	sys_process_vm_writev
+ 312	common	kcmp			sys_kcmp
+ 313	common	finit_module		sys_finit_module
+-
++#ifdef CONFIG_CAGE
++314	64	chmem			sys_chmem
++#endif
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+ # for native 64-bit operation.
+diff -prauN pure/linux-3.9.4/chmem/chmem.c BPF/linux-3.9.4/chmem/chmem.c
+--- pure/linux-3.9.4/chmem/chmem.c	1969-12-31 19:00:00.000000000 -0500
++++ BPF/linux-3.9.4/chmem/chmem.c	2014-08-07 15:40:32.199434530 -0400
+@@ -0,0 +1,111 @@
++#include <linux/kernel.h>
++#include <linux/linkage.h>
++#include <linux/errno.h>
++#include <linux/mm.h>
++#include <asm/uaccess.h>
++#include <linux/pid.h>
++#include <linux/cage.h>
++#include <linux/sched.h>
++
++#define NX 0x8000000000000000
++#define CAGE 0x0000000000000200
++#define US 0x000000000000004
++
++
++
++long uncage_vm_area(pid_t pid, unsigned long address){
++	struct task_struct *ts;
++	struct mm_struct *mm;
++	struct vm_area_struct *vm;
++	unsigned long addr;
++	pte_t *pte;
++	pteval_t new;
++
++	ts = pid_task(find_vpid(pid), PIDTYPE_PID);
++	if(!ts)
++		return -ESRCH;
++	mm = ts->mm;
++	down_write(&mm->mmap_sem);
++	vm = find_vma(mm, address);
++	if(!vm){
++		up_write(&mm->mmap_sem);
++		return -EFAULT;
++	}
++	
++	vm->vm_page_prot.pgprot |= US;
++	vm->vm_page_prot.pgprot &= ~CAGE;
++	addr = vm->vm_start;
++	while(addr < vm->vm_end){
++		pte = cage_lookup_address(addr,mm);
++		new = pte_val(*pte);
++		if(!pte_none(*pte)){
++			new |= US;
++			new &= ~CAGE;
++			set_pte_atomic(pte, __pte(new));
++		}
++		addr += PAGE_SIZE;
++	}
++
++	up_write(&mm->mmap_sem);
++	
++	return 0;
++}
++
++long cage_vm_area(pid_t pid, unsigned long address, unsigned long label){
++	struct task_struct *ts;
++	struct mm_struct *mm;
++	struct vm_area_struct *vm;
++	unsigned long new_page_prot;
++	unsigned long old_nx;
++	unsigned long addr;
++	pte_t *pte;
++	pteval_t new;
++
++	ts = pid_task(find_vpid(pid), PIDTYPE_PID);
++	if(!ts)
++		return -ESRCH;
++	mm = ts->mm;
++	down_write(&mm->mmap_sem);
++	vm = find_vma(mm, address);
++	if(!vm){
++		up_write(&mm->mmap_sem);
++		return -EFAULT;
++	}
++	old_nx = vm->vm_page_prot.pgprot & NX;
++	new_page_prot = label << 52;
++	if(old_nx == 0x8000000000000000)
++		new_page_prot |= old_nx;
++	else
++		new_page_prot &= old_nx;	
++	vm->vm_page_prot.pgprot |= new_page_prot; 
++	vm->vm_page_prot.pgprot &= ~US;
++	vm->vm_page_prot.pgprot |= CAGE;
++	addr = vm->vm_start;
++	while(addr < vm->vm_end){
++		pte = cage_lookup_address(addr, mm);		
++		new = pte_val(*pte);
++		if(!pte_none(*pte)){
++			new |= new_page_prot;
++			new &= ~US;
++			new |= CAGE;
++			set_pte_atomic(pte, __pte(new));
++		}
++		addr += PAGE_SIZE;		
++	}
++	ts->caged_process = 1;
++	up_write(&mm->mmap_sem);
++	
++	return 0;
++}
++
++asmlinkage long sys_chmem(int selection, pid_t pid, unsigned long address, unsigned long label){
++
++	if(selection == 0){
++		return cage_vm_area(pid, address, label);
++	}
++	else if(selection == 1){
++		return uncage_vm_area(pid, address);
++	}
++	else
++		return -EINVAL;
++}
+diff -prauN pure/linux-3.9.4/chmem/Makefile BPF/linux-3.9.4/chmem/Makefile
+--- pure/linux-3.9.4/chmem/Makefile	1969-12-31 19:00:00.000000000 -0500
++++ BPF/linux-3.9.4/chmem/Makefile	2014-07-11 17:11:02.098817531 -0400
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_CAGE) := chmem.o
++
+diff -prauN pure/linux-3.9.4/fs/binfmt_elf.c BPF/linux-3.9.4/fs/binfmt_elf.c
+--- pure/linux-3.9.4/fs/binfmt_elf.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/fs/binfmt_elf.c	2014-08-07 15:13:57.207528030 -0400
+@@ -790,10 +790,14 @@ static int load_elf_binary(struct linux_
+ 			elf_prot |= PROT_WRITE;
+ 		if (elf_ppnt->p_flags & PF_X)
+ 			elf_prot |= PROT_EXEC;
+-
+ 		elf_flags = MAP_PRIVATE | MAP_DENYWRITE | MAP_EXECUTABLE;
+ 
+ 		vaddr = elf_ppnt->p_vaddr;
++#ifdef CONFIG_CAGE
++		if(current->caged_process){	
++			elf_prot |= PROT_CAGED;
++		}
++#endif
+ 		if (loc->elf_ex.e_type == ET_EXEC || load_addr_set) {
+ 			elf_flags |= MAP_FIXED;
+ 		} else if (loc->elf_ex.e_type == ET_DYN) {
+diff -prauN pure/linux-3.9.4/fs/exec.c BPF/linux-3.9.4/fs/exec.c
+--- pure/linux-3.9.4/fs/exec.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/fs/exec.c	2014-08-07 15:15:44.007521769 -0400
+@@ -66,6 +66,11 @@
+ 
+ #include <trace/events/sched.h>
+ 
++#ifdef CONFIG_CAGE
++#include <linux/cage.h>
++#include <linux/netdevice.h>
++#endif
++
+ int suid_dumpable = 0;
+ 
+ static LIST_HEAD(formats);
+@@ -267,6 +272,14 @@ static int __bprm_mm_init(struct linux_b
+ 	vma->vm_start = vma->vm_end - PAGE_SIZE;
+ 	vma->vm_flags = VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
+ 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
++#ifdef CONFIG_CAGE
++      	if(current->caged_process){
++         	vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_BIT;
++                vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot &~ US_BIT;
++                vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_LABEL;
++		current->caged_process = 1;
++        }
++#endif
+ 	INIT_LIST_HEAD(&vma->anon_vma_chain);
+ 
+ 	err = insert_vm_struct(mm, vma);
+@@ -653,6 +666,7 @@ int setup_arg_pages(struct linux_binprm 
+ 	unsigned long stack_expand;
+ 	unsigned long rlim_stack;
+ 
++
+ #ifdef CONFIG_STACK_GROWSUP
+ 	/* Limit stack size to 1GB */
+ 	stack_base = rlimit_max(RLIMIT_STACK);
+@@ -707,6 +721,15 @@ int setup_arg_pages(struct linux_binprm 
+ 		goto out_unlock;
+ 	BUG_ON(prev != vma);
+ 
++#ifdef CONFIG_CAGE
++      	if(current->caged_process){
++         	vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_BIT;
++                vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot &~ US_BIT;
++                vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_LABEL;
++		current->caged_process = 1;
++        }
++#endif
++
+ 	/* Move stack pages down in memory. */
+ 	if (stack_shift) {
+ 		ret = shift_arg_pages(vma, stack_shift);
+@@ -719,6 +742,8 @@ int setup_arg_pages(struct linux_binprm 
+ 
+ 	stack_expand = 131072UL; /* randomly 32*4k (or 2*64k) pages */
+ 	stack_size = vma->vm_end - vma->vm_start;
++
++
+ 	/*
+ 	 * Align this down to a page boundary as expand_stack
+ 	 * will align it up.
+@@ -739,7 +764,6 @@ int setup_arg_pages(struct linux_binprm 
+ 	ret = expand_stack(vma, stack_base);
+ 	if (ret)
+ 		ret = -EFAULT;
+-
+ out_unlock:
+ 	up_write(&mm->mmap_sem);
+ 	return ret;
+diff -prauN pure/linux-3.9.4/fs/proc/task_mmu.c BPF/linux-3.9.4/fs/proc/task_mmu.c
+--- pure/linux-3.9.4/fs/proc/task_mmu.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/fs/proc/task_mmu.c	2014-07-11 17:11:02.126817530 -0400
+@@ -12,6 +12,10 @@
+ #include <linux/swap.h>
+ #include <linux/swapops.h>
+ 
++#ifdef CONFIG_CAGE
++#include <linux/cage.h>
++#endif
++
+ #include <asm/elf.h>
+ #include <asm/uaccess.h>
+ #include <asm/tlbflush.h>
+@@ -285,13 +289,16 @@ show_map_vma(struct seq_file *m, struct 
+ 	if (stack_guard_page_end(vma, end))
+ 		end -= PAGE_SIZE;
+ 
+-	seq_printf(m, "%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu %n",
++	seq_printf(m, "%08lx-%08lx %c%c%c%c%c %08llx %02x:%02x %lu %n",
+ 			start,
+ 			end,
+ 			flags & VM_READ ? 'r' : '-',
+ 			flags & VM_WRITE ? 'w' : '-',
+ 			flags & VM_EXEC ? 'x' : '-',
+ 			flags & VM_MAYSHARE ? 's' : 'p',
++#ifdef CONFIG_CAGE	
++			vma->vm_page_prot.pgprot & CAGE_BIT ? 'c' : '-',
++#endif
+ 			pgoff,
+ 			MAJOR(dev), MINOR(dev), ino, &len);
+ 
+diff -prauN pure/linux-3.9.4/include/linux/cage.h BPF/linux-3.9.4/include/linux/cage.h
+--- pure/linux-3.9.4/include/linux/cage.h	1969-12-31 19:00:00.000000000 -0500
++++ BPF/linux-3.9.4/include/linux/cage.h	2014-07-16 22:15:08.528389357 -0400
+@@ -0,0 +1,76 @@
++#ifdef CONFIG_CAGE
++
++#include <uapi/linux/filter.h>
++
++#define CAGE_BIT 0x00000200
++#define US_BIT  0x00000004
++#define CAGE_WRITE 0x00000002
++#define CAGE_FETCH 0x00000010
++#define CAGE_LABEL 0x7ff0000000000000
++#define PTE_METADATA 0x00000000000003ff
++#define RWX_FLAGS 0x12
++#define packed_data __attribute__((__packed__))
++
++
++struct cage_filter{
++	unsigned long start_address;
++	unsigned long end_address;
++	int num_events;
++	unsigned char type;
++	struct sock_filter insns[];
++};
++
++struct memevent_packet{
++	unsigned long src;
++	unsigned long dest;
++	unsigned int src_dest_pte;
++	unsigned char rwx;
++	unsigned char instruction[15];
++	unsigned int pid;
++	unsigned int uid;
++	unsigned long data;
++}packed_data;
++extern void cage_set_flag(int value);
++extern void cage_set_stored_ea(unsigned long value);
++extern void cage_clear_eip(void);
++extern void cage_clear_rax(void);
++extern void cage_clear_current_events(void);
++extern unsigned long cage_load_filter(int offset);
++extern void set_cage_filter(struct cage_filter *filter);
++extern unsigned long cage_get_ea(void);
++extern unsigned long cage_get_begin_address(void);
++extern unsigned long cage_get_end_address(void);
++extern int cage_get_num_events(void);
++extern int cage_get_current_events(void);
++extern void set_queue_start(struct memevent_packet *queue);
++extern struct memevent_packet* dequeue(void);
++extern void cage_enqueue(struct memevent_packet *mp);
++extern struct memevent_packet* cage_get_queue_start(void);
++
++bool is_caged(struct pt_regs *regs, unsigned long fault_address, unsigned long fault_instruction, unsigned long error_code, struct mm_struct *mm);
++
++bool cage_page(struct pt_regs *regs, struct task_struct *ts);
++
++bool caged_pte_check(pte_t pte);
++
++pte_t* cage_lookup_address(unsigned long address, struct mm_struct *mm);
++
++#else
++
++static inline bool is_caged(struct pt_regs *regs, unsigned long fault_address, unsigned long fault_instruction, unsigned long error_code, struct mm_struct *mm)
++{
++	return 0;
++}
++
++static inline bool cage_page(struct pt_regs *regs){
++	return 0;
++}
++
++static inline bool caged_pte_check(pte_t pte){
++	return 0;
++}
++
++static inline pte_t* cage_lookup_address(unsigned long address, struct mm_struct *mm){
++	return 0;
++}
++#endif
+diff -prauN pure/linux-3.9.4/include/linux/filter.h BPF/linux-3.9.4/include/linux/filter.h
+--- pure/linux-3.9.4/include/linux/filter.h	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/include/linux/filter.h	2014-07-14 21:56:05.303557544 -0400
+@@ -37,7 +37,7 @@ static inline unsigned int sk_filter_len
+ }
+ 
+ extern int sk_filter(struct sock *sk, struct sk_buff *skb);
+-extern unsigned int sk_run_filter(const struct sk_buff *skb,
++extern unsigned long sk_run_filter(const struct sk_buff *skb,
+ 				  const struct sock_filter *filter);
+ extern int sk_unattached_filter_create(struct sk_filter **pfp,
+ 				       struct sock_fprog *fprog);
+@@ -123,6 +123,7 @@ enum {
+ 	BPF_S_ANC_RXHASH,
+ 	BPF_S_ANC_CPU,
+ 	BPF_S_ANC_ALU_XOR_X,
++	BPF_S_ANC_CAGE_LD_W,
+ 	BPF_S_ANC_SECCOMP_LD_W,
+ 	BPF_S_ANC_VLAN_TAG,
+ 	BPF_S_ANC_VLAN_TAG_PRESENT,
+diff -prauN pure/linux-3.9.4/include/linux/mm.h BPF/linux-3.9.4/include/linux/mm.h
+--- pure/linux-3.9.4/include/linux/mm.h	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/include/linux/mm.h	2014-07-11 17:11:02.147817529 -0400
+@@ -87,6 +87,10 @@ extern unsigned int kobjsize(const void 
+ #define VM_PFNMAP	0x00000400	/* Page-ranges managed without "struct page", just pure PFN */
+ #define VM_DENYWRITE	0x00000800	/* ETXTBSY on write attempts.. */
+ 
++#ifdef CONFIG_CAGE
++#define VM_CAGED	0x00001000
++#endif
++
+ #define VM_LOCKED	0x00002000
+ #define VM_IO           0x00004000	/* Memory mapped I/O or similar */
+ 
+diff -prauN pure/linux-3.9.4/include/linux/sched.h BPF/linux-3.9.4/include/linux/sched.h
+--- pure/linux-3.9.4/include/linux/sched.h	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/include/linux/sched.h	2014-08-06 14:25:11.362092697 -0400
+@@ -1205,6 +1205,18 @@ struct task_struct {
+ 	unsigned int flags;	/* per process flags, defined below */
+ 	unsigned int ptrace;
+ 
++#ifdef CONFIG_CAGE
++	bool uncaged_flag;
++	unsigned long f_address;
++	unsigned long f_address2;
++	unsigned long ex_address4;
++	unsigned long ex_address3;
++	unsigned long ex_address2;
++	unsigned long ex_address;
++	int ex_flag;
++	bool caged_process;
++#endif
++
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+ 	int on_cpu;
+diff -prauN pure/linux-3.9.4/include/linux/syscalls.h BPF/linux-3.9.4/include/linux/syscalls.h
+--- pure/linux-3.9.4/include/linux/syscalls.h	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/include/linux/syscalls.h	2014-07-11 17:11:02.148817529 -0400
+@@ -897,4 +897,7 @@ asmlinkage long sys_process_vm_writev(pi
+ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ 			 unsigned long idx1, unsigned long idx2);
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
++#ifdef CONFIG_CAGE
++asmlinkage long sys_chmem(int selection, pid_t pid, unsigned long address, unsigned long label);
++#endif
+ #endif
+diff -prauN pure/linux-3.9.4/include/uapi/asm-generic/mman-common.h BPF/linux-3.9.4/include/uapi/asm-generic/mman-common.h
+--- pure/linux-3.9.4/include/uapi/asm-generic/mman-common.h	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/include/uapi/asm-generic/mman-common.h	2014-07-11 17:11:02.149817528 -0400
+@@ -14,6 +14,10 @@
+ #define PROT_GROWSDOWN	0x01000000	/* mprotect flag: extend change to start of growsdown vma */
+ #define PROT_GROWSUP	0x02000000	/* mprotect flag: extend change to end of growsup vma */
+ 
++#ifdef CONFIG_CAGE
++#define PROT_CAGED	0x00001000
++#endif
++
+ #define MAP_SHARED	0x01		/* Share changes */
+ #define MAP_PRIVATE	0x02		/* Changes are private */
+ #define MAP_TYPE	0x0f		/* Mask for type of mapping */
+diff -prauN pure/linux-3.9.4/include/uapi/linux/sched.h BPF/linux-3.9.4/include/uapi/linux/sched.h
+--- pure/linux-3.9.4/include/uapi/linux/sched.h	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/include/uapi/linux/sched.h	2014-07-11 17:11:02.149817528 -0400
+@@ -23,6 +23,9 @@
+ #define CLONE_CHILD_SETTID	0x01000000	/* set the TID in the child */
+ /* 0x02000000 was previously the unused CLONE_STOPPED (Start in stopped state)
+    and is now available for re-use. */
++#ifdef CONFIG_CAGE
++#define CLONE_CAGE		0x02000000
++#endif
+ #define CLONE_NEWUTS		0x04000000	/* New utsname group? */
+ #define CLONE_NEWIPC		0x08000000	/* New ipcs */
+ #define CLONE_NEWUSER		0x10000000	/* New user namespace */
+diff -prauN pure/linux-3.9.4/kernel/fork.c BPF/linux-3.9.4/kernel/fork.c
+--- pure/linux-3.9.4/kernel/fork.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/kernel/fork.c	2014-07-11 17:11:02.152817528 -0400
+@@ -1594,6 +1594,11 @@ long do_fork(unsigned long clone_flags,
+ 
+ 	p = copy_process(clone_flags, stack_start, stack_size,
+ 			 child_tidptr, NULL, trace);
++
++#ifdef CONFIG_CAGE
++	if(clone_flags & CLONE_CAGE)
++		p->caged_process = 1;
++#endif
+ 	/*
+ 	 * Do this prior waking up the new thread - the thread pointer
+ 	 * might get invalid after that point, if the thread exits quickly.
+diff -prauN pure/linux-3.9.4/Makefile BPF/linux-3.9.4/Makefile
+--- pure/linux-3.9.4/Makefile	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/Makefile	2014-07-11 17:11:59.582814162 -0400
+@@ -1,7 +1,7 @@
+ VERSION = 3
+ PATCHLEVEL = 9
+ SUBLEVEL = 4
+-EXTRAVERSION =
++EXTRAVERSION = .CAGE.BPF
+ NAME = Unicycling Gorilla
+ 
+ # *DOCUMENTATION*
+@@ -733,7 +733,7 @@ export mod_sign_cmd
+ 
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ mm/ fs/ ipc/ security/ crypto/ block/ chmem/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, $(init-y) $(init-m) \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff -prauN pure/linux-3.9.4/mm/memory.c BPF/linux-3.9.4/mm/memory.c
+--- pure/linux-3.9.4/mm/memory.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/mm/memory.c	2014-07-11 17:11:02.153817528 -0400
+@@ -60,6 +60,10 @@
+ #include <linux/migrate.h>
+ #include <linux/string.h>
+ 
++#ifdef CONFIG_CAGE
++#include <linux/cage.h>
++#endif
++
+ #include <asm/io.h>
+ #include <asm/pgalloc.h>
+ #include <asm/uaccess.h>
+@@ -786,6 +790,13 @@ struct page *vm_normal_page(struct vm_ar
+ 			goto check_pfn;
+ 		if (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))
+ 			return NULL;
++#ifdef CONFIG_CAGE
++		if(current->caged_process || !caged_pte_check(pte)){
++			if(is_zero_pfn(pfn))
++				return NULL;
++			goto check_pfn;
++		}
++#endif
+ 		if (!is_zero_pfn(pfn))
+ 			print_bad_pte(vma, addr, pte, NULL);
+ 		return NULL;
+@@ -1118,6 +1129,7 @@ again:
+ 	arch_enter_lazy_mmu_mode();
+ 	do {
+ 		pte_t ptent = *pte;
++		
+ 		if (pte_none(ptent)) {
+ 			continue;
+ 		}
+@@ -1165,8 +1177,10 @@ again:
+ 				rss[MM_FILEPAGES]--;
+ 			}
+ 			page_remove_rmap(page);
+-			if (unlikely(page_mapcount(page) < 0))
++			if (unlikely(page_mapcount(page) < 0)){
++				printk("Call 1\n");
+ 				print_bad_pte(vma, addr, ptent, page);
++			}
+ 			force_flush = !__tlb_remove_page(tlb, page);
+ 			if (force_flush)
+ 				break;
+@@ -1179,8 +1193,10 @@ again:
+ 		if (unlikely(details))
+ 			continue;
+ 		if (pte_file(ptent)) {
+-			if (unlikely(!(vma->vm_flags & VM_NONLINEAR)))
++			if (unlikely(!(vma->vm_flags & VM_NONLINEAR))){
++				printk("Call 2\n");
+ 				print_bad_pte(vma, addr, ptent, NULL);
++			}
+ 		} else {
+ 			swp_entry_t entry = pte_to_swp_entry(ptent);
+ 
+@@ -1196,8 +1212,10 @@ again:
+ 				else
+ 					rss[MM_FILEPAGES]--;
+ 			}
+-			if (unlikely(!free_swap_and_cache(entry)))
++			if (unlikely(!free_swap_and_cache(entry))){
++				printk("Call 3\n");
+ 				print_bad_pte(vma, addr, ptent, NULL);
++			}
+ 		}
+ 		pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+diff -prauN pure/linux-3.9.4/mm/mmap.c BPF/linux-3.9.4/mm/mmap.c
+--- pure/linux-3.9.4/mm/mmap.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/mm/mmap.c	2014-08-07 15:13:23.687529995 -0400
+@@ -34,6 +34,11 @@
+ #include <linux/rbtree_augmented.h>
+ #include <linux/sched/sysctl.h>
+ 
++#ifdef CONFIG_CAGE
++#include <linux/cage.h>
++#include <linux/netdevice.h>
++#endif
++
+ #include <asm/uaccess.h>
+ #include <asm/cacheflush.h>
+ #include <asm/tlb.h>
+@@ -1214,6 +1219,11 @@ unsigned long do_mmap_pgoff(struct file 
+ 	vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags) |
+ 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+ 
++#ifdef CONFIG_CAGE
++	if(prot & PROT_CAGED)
++		vm_flags |= VM_CAGED;
++#endif
++
+ 	if (flags & MAP_LOCKED)
+ 		if (!can_do_mlock())
+ 			return -EPERM;
+@@ -1443,7 +1453,10 @@ unsigned long mmap_region(struct file *f
+ 	struct rb_node **rb_link, *rb_parent;
+ 	unsigned long charged = 0;
+ 	struct inode *inode =  file ? file_inode(file) : NULL;
+-
++#ifdef CONFIG_CAGE
++	struct net_device *dev;
++	struct memevent_packet *mp;
++#endif
+ 	/* Clear old maps */
+ 	error = -ENOMEM;
+ munmap_back:
+@@ -1466,13 +1479,19 @@ munmap_back:
+ 			return -ENOMEM;
+ 		vm_flags |= VM_ACCOUNT;
+ 	}
+-
++#ifdef CONFIG_CAGE
++	if(current->caged_process || vm_flags & VM_CAGED)
++		goto disallow_merge;
++#endif
+ 	/*
+ 	 * Can we just expand an old mapping?
+ 	 */
+ 	vma = vma_merge(mm, prev, addr, addr + len, vm_flags, NULL, file, pgoff, NULL);
+ 	if (vma)
+ 		goto out;
++#ifdef CONFIG_CAGE
++disallow_merge:
++#endif
+ 
+ 	/*
+ 	 * Determine the object being mapped and call the appropriate
+@@ -1544,6 +1563,34 @@ munmap_back:
+ 			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ 	}
+ 
++#ifdef CONFIG_CAGE
++	if((current->caged_process) || (vm_flags & VM_CAGED)){
++			vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_BIT;
++			vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot &~ US_BIT;
++			vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_LABEL;
++			current->caged_process = 1;
++	}
++	if(current->caged_process){
++		if(cage_get_queue_start()){
++			struct net *net = current->nsproxy->net_ns;
++			dev = __dev_get_by_name(net, "me");
++			mp = kmalloc(sizeof(struct memevent_packet), GFP_KERNEL);
++			mp->src = vma->vm_start;
++			mp->dest = vma->vm_end;
++			mp->src_dest_pte = vma->vm_page_prot.pgprot;
++			if(vma->vm_page_prot.pgprot & CAGE_BIT)
++				mp->rwx = 0x09;
++			else
++				mp->rwx = 0x08;
++			mp->pid = current->pid;
++			mp->uid = current->real_cred->uid;
++			mp->data = 0x0000000000000001;
++			cage_enqueue(mp);
++			dev->netdev_ops->ndo_start_xmit(NULL, dev);
++			kfree(mp);
++		}
++	}
++#endif
+ 	vma_link(mm, vma, prev, rb_link, rb_parent);
+ 	file = vma->vm_file;
+ 
+@@ -1565,6 +1612,7 @@ out:
+ 	if (file)
+ 		uprobe_mmap(vma);
+ 
++
+ 	return addr;
+ 
+ unmap_and_free_vma:
+@@ -2136,6 +2184,10 @@ int expand_downwards(struct vm_area_stru
+ {
+ 	int error;
+ 
++#ifdef CONFIG_CAGE
++	struct net_device *dev;
++	struct memevent_packet *mp;
++#endif
+ 	/*
+ 	 * We must make sure the anon_vma is allocated
+ 	 * so that the anon_vma locking is not a noop.
+@@ -2187,6 +2239,27 @@ int expand_downwards(struct vm_area_stru
+ 				spin_unlock(&vma->vm_mm->page_table_lock);
+ 
+ 				perf_event_mmap(vma);
++#ifdef CONFIG_CAGE
++
++		        	if(current->caged_process){
++                			if(cage_get_queue_start()){
++                        			struct net *net = current->nsproxy->net_ns;
++                       	 			dev = __dev_get_by_name(net, "me");
++                        			mp = kmalloc(sizeof(struct memevent_packet), GFP_KERNEL);
++                        			mp->src = vma->vm_start;
++                        			mp->dest = vma->vm_end;
++                        			mp->src_dest_pte = vma->vm_page_prot.pgprot;
++                        			mp->rwx = 0x09;
++                        			mp->pid = current->pid;
++                        			mp->uid = current->real_cred->uid;
++                        			mp->data = 0x0000000000000002;
++                        			cage_enqueue(mp);
++                        			dev->netdev_ops->ndo_start_xmit(NULL, dev);
++              					kfree(mp);
++		  			}
++        			}
++#endif
++
+ 			}
+ 		}
+ 	}
+@@ -2565,7 +2638,10 @@ static unsigned long do_brk(unsigned lon
+ 	struct rb_node ** rb_link, * rb_parent;
+ 	pgoff_t pgoff = addr >> PAGE_SHIFT;
+ 	int error;
+-
++#ifdef CONFIG_CAGE
++	struct net_device *dev;
++	struct memevent_packet *mp;
++#endif
+ 	len = PAGE_ALIGN(len);
+ 	if (!len)
+ 		return addr;
+@@ -2614,13 +2690,18 @@ static unsigned long do_brk(unsigned lon
+ 
+ 	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
+ 		return -ENOMEM;
+-
++#ifdef CONFIG_CAGE
++	if(current->caged_process)
++		goto no_merge;
++#endif
+ 	/* Can we just expand an old private anonymous mapping? */
+ 	vma = vma_merge(mm, prev, addr, addr + len, flags,
+ 					NULL, NULL, pgoff, NULL);
+ 	if (vma)
+ 		goto out;
+-
++#ifdef CONFIG_CAGE
++no_merge:
++#endif
+ 	/*
+ 	 * create a vma struct for an anonymous mapping
+ 	 */
+@@ -2638,6 +2719,34 @@ static unsigned long do_brk(unsigned lon
+ 	vma->vm_flags = flags;
+ 	vma->vm_page_prot = vm_get_page_prot(flags);
+ 	vma_link(mm, vma, prev, rb_link, rb_parent);
++#ifdef CONFIG_CAGE
++	if(current->caged_process){
++		vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_BIT;
++		vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot &~ US_BIT;
++		vma->vm_page_prot.pgprot = vma->vm_page_prot.pgprot | CAGE_LABEL;
++	}
++	if(current->caged_process){
++		if(cage_get_queue_start()){
++			struct net *net = current->nsproxy->net_ns;
++			dev = __dev_get_by_name(net, "me");
++			mp = kmalloc(sizeof(struct memevent_packet), GFP_KERNEL);
++			mp->src = vma->vm_start;
++			mp->dest = vma->vm_end;
++			mp->src_dest_pte = vma->vm_page_prot.pgprot;
++			if(vma->vm_page_prot.pgprot & CAGE_BIT)
++				mp->rwx = 0x09;
++			else
++				mp->rwx = 0x08;
++			mp->pid = current->pid;
++			mp->uid = current->real_cred->uid;
++			mp->data = 0x0000000000000003;
++			cage_enqueue(mp);
++			dev->netdev_ops->ndo_start_xmit(NULL, dev);
++			kfree(mp);
++		}
++		
++	}
++#endif
+ out:
+ 	perf_event_mmap(vma);
+ 	mm->total_vm += len >> PAGE_SHIFT;
+diff -prauN pure/linux-3.9.4/net/core/filter.c BPF/linux-3.9.4/net/core/filter.c
+--- pure/linux-3.9.4/net/core/filter.c	2013-05-24 14:45:59.000000000 -0400
++++ BPF/linux-3.9.4/net/core/filter.c	2014-08-07 15:10:40.870539539 -0400
+@@ -40,6 +40,7 @@
+ #include <linux/ratelimit.h>
+ #include <linux/seccomp.h>
+ #include <linux/if_vlan.h>
++#include <linux/cage.h>
+ 
+ /* No hurry in this branch
+  *
+@@ -121,15 +122,20 @@ EXPORT_SYMBOL(sk_filter);
+  * and last instruction guaranteed to be a RET, we dont need to check
+  * flen. (We used to pass to this function the length of filter)
+  */
+-unsigned int sk_run_filter(const struct sk_buff *skb,
++unsigned long sk_run_filter(const struct sk_buff *skb,
+ 			   const struct sock_filter *fentry)
+ {
+ 	void *ptr;
+-	u32 A = 0;			/* Accumulator */
+-	u32 X = 0;			/* Index Register */
+-	u32 mem[BPF_MEMWORDS];		/* Scratch Memory Store */
+-	u32 tmp;
+-	int k;
++	unsigned long A = 0;
++	unsigned long X = 0;
++	unsigned long mem[BPF_MEMWORDS];
++	unsigned long tmp;
++	//u32 A = 0;			/* Accumulator */
++	//u32 X = 0;			/* Index Register */
++	//u32 mem[BPF_MEMWORDS];		/* Scratch Memory Store */
++	//u32 tmp;
++	long k;
++	//int k;
+ 
+ 	/*
+ 	 * Process array of filter instructions.
+@@ -138,7 +144,8 @@ unsigned int sk_run_filter(const struct 
+ #if defined(CONFIG_X86_32)
+ #define	K (fentry->k)
+ #else
+-		const u32 K = fentry->k;
++		//const u32 K = fentry->k;
++		unsigned long K = fentry->k;
+ #endif
+ 
+ 		switch (fentry->code) {
+@@ -383,6 +390,11 @@ load_b:
+ 				A = 0;
+ 			continue;
+ 		}
++#ifdef CONFIG_CAGE
++		case BPF_S_ANC_CAGE_LD_W:
++			A = cage_load_filter(fentry->k);
++			continue;
++#endif
+ #ifdef CONFIG_SECCOMP_FILTER
+ 		case BPF_S_ANC_SECCOMP_LD_W:
+ 			A = seccomp_bpf_load(fentry->k);
+@@ -812,6 +824,7 @@ static void sk_decode_filter(struct sock
+ 		[BPF_S_ANC_CPU]		= BPF_LD|BPF_B|BPF_ABS,
+ 		[BPF_S_ANC_ALU_XOR_X]	= BPF_LD|BPF_B|BPF_ABS,
+ 		[BPF_S_ANC_SECCOMP_LD_W] = BPF_LD|BPF_B|BPF_ABS,
++		[BPF_S_ANC_CAGE_LD_W]	= BPF_LD|BPF_W|BPF_ABS,
+ 		[BPF_S_ANC_VLAN_TAG]	= BPF_LD|BPF_B|BPF_ABS,
+ 		[BPF_S_ANC_VLAN_TAG_PRESENT] = BPF_LD|BPF_B|BPF_ABS,
+ 		[BPF_S_LD_W_LEN]	= BPF_LD|BPF_W|BPF_LEN,
